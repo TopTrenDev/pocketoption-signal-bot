@@ -32,6 +32,9 @@ class BotConfig:
     rsi_period: int = int(os.getenv("PO_RSI_PERIOD", "14"))
     buy_rsi_min: float = float(os.getenv("PO_BUY_RSI_MIN", "52"))
     sell_rsi_max: float = float(os.getenv("PO_SELL_RSI_MAX", "48"))
+    rsi_neutral_band: float = float(os.getenv("PO_RSI_NEUTRAL_BAND", "1.5"))
+    min_ema_gap: float = float(os.getenv("PO_MIN_EMA_GAP", "0.0"))
+    require_momentum_confirm: bool = _env_bool("PO_REQUIRE_MOMENTUM_CONFIRM", True)
 
     # Risk controls
     trade_amount: float = float(os.getenv("PO_TRADE_AMOUNT", "1.0"))
@@ -72,6 +75,12 @@ class BotConfig:
     po_browser_startup_wait_sec: int = int(os.getenv("PO_BROWSER_STARTUP_WAIT_SEC", "5"))
     # When chart price is canvas-only, read quotes from page WebSocket (e.g. update_quotes)
     po_use_ws_quotes: bool = _env_bool("PO_USE_WS_QUOTES", True)
+    # Human-readable lines in the terminal (in addition to JSONL file)
+    po_console_log: bool = _env_bool("PO_CONSOLE_LOG", True)
+    # Floating status box injected into the Playwright page (demo/live with visible browser)
+    po_browser_overlay: bool = _env_bool("PO_BROWSER_OVERLAY", True)
+    # Print compact websocket debug lines to terminal for quote parsing diagnostics
+    po_ws_debug: bool = _env_bool("PO_WS_DEBUG", False)
 
     @property
     def price_selector_list(self) -> list[str]:

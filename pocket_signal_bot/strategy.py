@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 Signal = Literal["CALL", "PUT", "NO_TRADE"]
 
@@ -57,6 +57,9 @@ class StrategyConfig:
     rsi_period: int = 14
     buy_rsi_min: float = 52.0
     sell_rsi_max: float = 48.0
+    rsi_neutral_band: float = 1.5
+    min_ema_gap: float = 0.0
+    require_momentum_confirm: bool = True
 
 
 class EmaRsiStrategy:
@@ -64,19 +67,55 @@ class EmaRsiStrategy:
         self.cfg = cfg
 
     def generate(self, close_prices: List[float]) -> Signal:
-        min_len = max(self.cfg.ema_slow, self.cfg.rsi_period) + 2
-        if len(close_prices) < min_len:
-            return "NO_TRADE"
+        return self.generate_details(close_prices)["signal"]
 
-        f = ema(close_prices, self.cfg.ema_fast)
-        s = ema(close_prices, self.cfg.ema_slow)
-        r = rsi(close_prices, self.cfg.rsi_period)
+    def generate_details(self, close_prices: List[float]) -> dict[str, Any]:
+        if len(close_prices) < 3:
+            return {
+                "signal": "NO_TRADE",
+                "ema_diff": 0.0,
+                "rsi": 50.0,
+                "momentum": 0.0,
+            }
+
+        # Adapt to short history from broker/browser so signal engine becomes active quickly.
+        available = len(close_prices)
+        ema_slow_period = min(self.cfg.ema_slow, max(2, available - 1))
+        ema_fast_period = min(self.cfg.ema_fast, max(1, ema_slow_period // 2))
+        rsi_period = min(self.cfg.rsi_period, max(2, available - 1))
+
+        f = ema(close_prices, ema_fast_period)
+        s = ema(close_prices, ema_slow_period)
+        r = rsi(close_prices, rsi_period)
 
         if f[-1] is None or s[-1] is None or r[-1] is None:
-            return "NO_TRADE"
-        if f[-1] > s[-1] and r[-1] >= self.cfg.buy_rsi_min:
-            return "CALL"
-        if f[-1] < s[-1] and r[-1] <= self.cfg.sell_rsi_max:
-            return "PUT"
-        return "NO_TRADE"
+            return {
+                "signal": "NO_TRADE",
+                "ema_diff": 0.0,
+                "rsi": 50.0,
+                "momentum": 0.0,
+            }
+
+        ema_diff = float(f[-1] - s[-1])
+        rsi_val = float(r[-1])
+        momentum = float(close_prices[-1] - close_prices[-3]) if len(close_prices) >= 3 else 0.0
+
+        signal: Signal
+        # Primary strict triggers.
+        if ema_diff > self.cfg.min_ema_gap and rsi_val >= self.cfg.buy_rsi_min:
+            if not self.cfg.require_momentum_confirm or momentum >= 0:
+                signal = "CALL"
+                return {"signal": signal, "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+        if ema_diff < -self.cfg.min_ema_gap and rsi_val <= self.cfg.sell_rsi_max:
+            if not self.cfg.require_momentum_confirm or momentum <= 0:
+                signal = "PUT"
+                return {"signal": signal, "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
+
+        # Weighted fallback to keep bot active in demo: trend + momentum vote.
+        vote = 0
+        vote += 1 if ema_diff >= 0 else -1
+        vote += 1 if rsi_val >= 50 else -1
+        vote += 1 if momentum >= 0 else -1
+        signal = "CALL" if vote >= 0 else "PUT"
+        return {"signal": signal, "ema_diff": ema_diff, "rsi": rsi_val, "momentum": momentum}
 

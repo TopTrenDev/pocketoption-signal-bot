@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 from collections import deque
 import json
+import re
 import time
 
 
@@ -16,6 +17,9 @@ class BrowserConfig:
     startup_wait_ms: int = 5000
     quote_asset: str = "EURUSD_otc"
     use_ws_quotes: bool = True
+    show_overlay: bool = True
+    ws_debug: bool = False
+    ws_debug_max_lines: int = 120
 
 
 class PocketOptionBrowserAdapter:
@@ -33,6 +37,12 @@ class PocketOptionBrowserAdapter:
         self._orders: dict[str, dict[str, Any]] = {}
         self._last_ws_price: float | None = None
         self._last_ws_ts: float = 0.0
+        self._ws_debug_lines = 0
+        self._ws_seen_urls: set[str] = set()
+
+    @property
+    def last_ws_quote(self) -> float | None:
+        return self._last_ws_price
 
     @staticmethod
     def _normalize_pair(asset: str) -> str:
@@ -40,7 +50,16 @@ class PocketOptionBrowserAdapter:
         return a
 
     def _on_websocket(self, ws: Any) -> None:
-        def on_frame(frame: Any) -> None:
+        ws_url = ""
+        try:
+            ws_url = str(getattr(ws, "url", "") or "")
+        except Exception:
+            ws_url = ""
+        if ws_url and ws_url not in self._ws_seen_urls:
+            self._ws_seen_urls.add(ws_url)
+            self._ws_debug(f"socket_open url={ws_url}")
+
+        def on_frame(frame: Any, direction: str = "recv") -> None:
             try:
                 text: str | None = None
                 if isinstance(frame, str):
@@ -53,18 +72,45 @@ class PocketOptionBrowserAdapter:
                     b = frame.body
                     text = b.decode("utf-8", errors="ignore") if isinstance(b, (bytes, bytearray)) else str(b)
                 if text:
-                    self._ingest_ws_payload(text)
+                    self._ingest_ws_payload(text, ws_url=ws_url, direction=direction)
             except Exception:
                 pass
 
         try:
-            ws.on("framereceived", on_frame)
+            ws.on("framereceived", lambda frame: on_frame(frame, "recv"))
         except Exception:
             pass
+        try:
+            ws.on("framesent", lambda frame: on_frame(frame, "sent"))
+        except Exception:
+            pass
+
+    def _ws_debug(self, message: str) -> None:
+        if not self.cfg.ws_debug:
+            return
+        if self._ws_debug_lines >= self.cfg.ws_debug_max_lines:
+            return
+        self._ws_debug_lines += 1
+        print(f"[WSDBG] {message}", flush=True)
 
     def _walk_quote_json(self, obj: Any, sym: str) -> float | None:
         """Find a plausible last price for sym inside nested JSON."""
         sym_u = self._normalize_pair(sym)
+        if isinstance(obj, list):
+            # Common compact quote tuples:
+            # ["EURUSD", ts, bid, ask] or ["EURUSD", bid, ask] or nested list of those tuples.
+            if obj and isinstance(obj[0], str):
+                pair = self._normalize_pair(obj[0])
+                if sym_u and (sym_u in pair or pair in sym_u):
+                    nums = [float(x) for x in obj[1:] if isinstance(x, (int, float))]
+                    # prefer last numeric as "last/ask" style fallback
+                    if nums:
+                        return nums[-1]
+            for item in obj:
+                r = self._walk_quote_json(item, sym)
+                if r is not None:
+                    return r
+            return None
         if isinstance(obj, dict):
             asset = (
                 obj.get("asset")
@@ -96,40 +142,55 @@ class PocketOptionBrowserAdapter:
                 r = self._walk_quote_json(v, sym)
                 if r is not None:
                     return r
-        elif isinstance(obj, list):
-            for item in obj:
-                r = self._walk_quote_json(item, sym)
-                if r is not None:
-                    return r
         return None
 
-    def _ingest_ws_payload(self, text: str) -> None:
+    @staticmethod
+    def _extract_json_array_text(text: str) -> str | None:
+        """
+        Extract a JSON array string from frame variants like:
+        - 42["event", {...}]
+        - 451-["event", {...}]
+        - prefixed non-json wrappers containing [...payload...]
+        """
+        m = re.search(r"(\[.*\])", text)
+        if not m:
+            return None
+        return m.group(1)
+
+    def _ingest_ws_payload(self, text: str, *, ws_url: str = "", direction: str = "recv") -> None:
         if not self.cfg.use_ws_quotes or len(text) < 2:
             return
         sym = self.cfg.quote_asset
-        for prefix in ("42", "43", "44"):
-            if not text.startswith(prefix):
-                continue
-            body = text[len(prefix) :].strip()
-            try:
-                payload = json.loads(body)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(payload, list) or not payload:
-                continue
-            evt = payload[0]
-            data = payload[1] if len(payload) > 1 else None
-            if isinstance(evt, str):
-                el = evt.lower()
-                if any(k in el for k in ("quote", "price", "tick", "rate", "candle")):
-                    p = self._walk_quote_json(data, sym)
-                    if p is not None:
-                        self._record_ws_price(p)
-                        return
-            p = self._walk_quote_json(payload, sym)
-            if p is not None:
-                self._record_ws_price(p)
+        array_text = self._extract_json_array_text(text)
+        if not array_text:
+            return
+        try:
+            payload = json.loads(array_text)
+        except json.JSONDecodeError:
+            self._ws_debug(f"{direction} non-json sample={text[:120]!r} url={ws_url[:80]}")
+            return
+        if not isinstance(payload, list) or not payload:
+            self._ws_debug(f"{direction} non-list sample={str(payload)[:120]} url={ws_url[:80]}")
+            return
+        evt = payload[0]
+        data = payload[1] if len(payload) > 1 else None
+        if isinstance(evt, str):
+            el = evt.lower()
+            if "chat" in el and not any(k in el for k in ("quote", "price", "tick", "rate", "candle", "history", "update", "asset", "symbol")):
                 return
+            self._ws_debug(f"{direction} evt={evt} sym={sym} data_type={type(data).__name__} url={ws_url[:80]}")
+            if any(k in el for k in ("quote", "price", "tick", "rate", "candle", "history", "asset", "symbol", "update")):
+                p = self._walk_quote_json(data, sym)
+                if p is not None:
+                    self._ws_debug(f"{direction} evt={evt} parsed_price={p}")
+                    self._record_ws_price(p)
+                    return
+        p = self._walk_quote_json(payload, sym)
+        if p is not None:
+            self._ws_debug(f"{direction} fallback parsed_price={p} evt={evt}")
+            self._record_ws_price(p)
+            return
+        self._ws_debug(f"{direction} evt={evt} no-price sample={str(payload)[:140]} url={ws_url[:80]}")
 
     def _record_ws_price(self, p: float) -> None:
         now = time.time()
@@ -149,6 +210,31 @@ class PocketOptionBrowserAdapter:
         self._page.on("websocket", self._on_websocket)
         await self._page.goto(self.cfg.base_url, wait_until="domcontentloaded")
         await self._page.wait_for_timeout(int(self.cfg.startup_wait_ms))
+
+    async def show_status_overlay(self, text: str) -> None:
+        """Fixed corner panel on the trading page (visible browser only)."""
+        if not self.cfg.show_overlay or self._page is None:
+            return
+        try:
+            await self._page.evaluate(
+                """(t) => {
+                  let el = document.getElementById('__po_bot_status__');
+                  if (!el) {
+                    el = document.createElement('div');
+                    el.id = '__po_bot_status__';
+                    el.style.cssText =
+                      'position:fixed;left:8px;bottom:8px;max-width:480px;z-index:2147483647;' +
+                      'background:rgba(0,0,0,.88);color:#7cfc00;font:12px/1.45 ui-monospace,Consolas,monospace;' +
+                      'white-space:pre-wrap;padding:10px 12px;border-radius:8px;border:1px solid #444;' +
+                      'box-shadow:0 2px 12px rgba(0,0,0,.5);pointer-events:none;';
+                    document.body.appendChild(el);
+                  }
+                  el.textContent = t;
+                }""",
+                text,
+            )
+        except Exception:
+            pass
 
     async def _read_price(self) -> float:
         if self._page is None:
