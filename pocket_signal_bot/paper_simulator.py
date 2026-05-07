@@ -40,7 +40,8 @@ class PocketPaperSimulator:
 
         if tie:
             pnl = 0.0
-            won = False
+            # Treat tie as neither win nor loss — don't penalise the losing-streak counter.
+            won = True
         elif won:
             pnl = amount * (payout_pct / 100.0)
         else:

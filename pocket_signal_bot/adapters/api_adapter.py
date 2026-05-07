@@ -1,19 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 import asyncio
-import time
-
-
-class AdapterProtocol(Protocol):
-    async def connect(self) -> None: ...
-    async def disconnect(self) -> None: ...
-    async def get_candles(self, asset: str, timeframe_sec: int, count: int) -> list[dict[str, Any]]: ...
-    async def get_payout_pct(self, asset: str) -> float: ...
-    async def place_order(self, asset: str, amount: float, direction: str, expiry_sec: int) -> str: ...
-    async def check_result(self, order_id: str, wait_sec: int) -> dict[str, Any]: ...
-    async def get_balance(self) -> float: ...
 
 
 @dataclass
@@ -34,7 +23,6 @@ class PocketOptionApiAdapter:
         self.cfg = cfg
         self._client = None
         self._deals = None
-        self._order_open_ts: dict[str, float] = {}
 
     async def connect(self) -> None:
         try:
@@ -68,7 +56,6 @@ class PocketOptionApiAdapter:
     async def get_candles(self, asset: str, timeframe_sec: int, count: int) -> list[dict[str, Any]]:
         if self._client is None:
             raise RuntimeError("API adapter is not connected")
-        # SDKs vary; try common candle method names.
         method_names = ("get_candles", "candles", "history", "get_history")
         for name in method_names:
             method = getattr(self._client, name, None)
@@ -96,7 +83,7 @@ class PocketOptionApiAdapter:
         raise RuntimeError("Could not fetch candles from unofficial SDK. Check SDK version/method names.")
 
     async def get_payout_pct(self, asset: str) -> float:
-        # Some SDKs do not expose payout directly; caller can inject static threshold.
+        # SDK does not expose payout; return 80 so caller falls through to browser path.
         return 80.0
 
     async def place_order(self, asset: str, amount: float, direction: str, expiry_sec: int) -> str:
@@ -119,9 +106,7 @@ class PocketOptionApiAdapter:
             option_type=100,
             time=expiry_sec,
         )
-        order_id = str(getattr(deal, "id", "")) or str(getattr(deal, "deal_id", ""))
-        self._order_open_ts[order_id] = time.time()
-        return order_id
+        return str(getattr(deal, "id", "")) or str(getattr(deal, "deal_id", ""))
 
     async def check_result(self, order_id: str, wait_sec: int) -> dict[str, Any]:
         if self._deals is None:
@@ -132,8 +117,9 @@ class PocketOptionApiAdapter:
             res = await self._deals.check_deal_result(wait_time=wait_sec, deal=deal)
             payload = res if isinstance(res, dict) else res.__dict__
             result = str(payload.get("result", payload.get("status", "unknown"))).lower()
-            won = result == "win" or float(payload.get("profit_amount", 0)) > 0
-            return {"order_id": order_id, "result": result, "won": won, "raw": payload}
+            profit = float(payload.get("profit_amount", 0))
+            won = result == "win" or profit > 0
+            return {"order_id": order_id, "result": result, "won": won, "pnl": profit, "raw": payload}
         except Exception:
             await asyncio.sleep(wait_sec + 1)
             return {"order_id": order_id, "result": "unknown", "won": False}
@@ -155,4 +141,3 @@ class PocketOptionApiAdapter:
             return 0.0
         except Exception:
             return 0.0
-

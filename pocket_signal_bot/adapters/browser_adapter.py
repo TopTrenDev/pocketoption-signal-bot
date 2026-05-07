@@ -14,6 +14,7 @@ class BrowserConfig:
     base_url: str = "https://pocketoption.com/en/cabinet/demo-quick-high-low/"
     is_real_account: bool = False
     price_selectors: tuple[str, ...] = ()
+    payout_selectors: tuple[str, ...] = ()
     startup_wait_ms: int = 5000
     quote_asset: str = "EURUSD_otc"
     use_ws_quotes: bool = True
@@ -293,21 +294,92 @@ class PocketOptionBrowserAdapter:
     async def get_payout_pct(self, asset: str) -> float:
         if self._page is None:
             return 80.0
-        selectors = [
+        # Prefer payout percentages from the RIGHT trading panel.
+        # This avoids grabbing unrelated top-tile values and "100% bonus" banner text.
+        try:
+            values = await self._page.evaluate(
+                """() => {
+                  const out = [];
+                  const w = window.innerWidth || 0;
+                  const re = /\\+?\\s*(\\d+(?:[\\.,]\\d+)?)\\s*%/g;
+                  const pushFrom = (el) => {
+                    if (!el) return;
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) return;
+                    if (r.right < w * 0.55) return; // keep right side only
+                    const txt = (el.textContent || "").trim();
+                    if (!txt) return;
+                    if (txt.toLowerCase().includes("bonus")) return;
+                    let m;
+                    while ((m = re.exec(txt)) !== null) out.push(m[1]);
+                  };
+
+                  const sels = [
+                    "[data-qa*='payout' i]",
+                    "[data-qa*='profit' i]",
+                    "[class*='payout' i]",
+                    "[class*='profit' i]",
+                    "[class*='return' i]",
+                  ];
+                  for (const s of sels) {
+                    for (const el of document.querySelectorAll(s)) pushFrom(el);
+                  }
+                  for (const el of document.querySelectorAll("*")) {
+                    const t = (el.textContent || "").toLowerCase();
+                    if (!t.includes("payout")) continue;
+                    pushFrom(el);
+                    pushFrom(el.parentElement);
+                  }
+                  return out;
+                }"""
+            )
+            if isinstance(values, list):
+                parsed: list[float] = []
+                for raw in values:
+                    try:
+                        v = float(str(raw).replace(",", "."))
+                    except Exception:
+                        continue
+                    # Keep below 99 to avoid accidental "100% bonus" matches.
+                    if 55.0 <= v < 99.0:
+                        parsed.append(v)
+                if parsed:
+                    return max(parsed)
+        except Exception:
+            pass
+
+        selectors = list(self.cfg.payout_selectors) + [
             ".profit-block .value",
             ".payout__value",
             "[data-qa='profit-percent']",
+            "[data-qa='payout']",
+            "[class*='payout']",
+            "[class*='profit']",
         ]
+        fallback_vals: list[float] = []
         for sel in selectors:
             try:
-                txt = await self._page.locator(sel).first.text_content(timeout=250)
-                if not txt:
-                    continue
-                digits = "".join(ch for ch in txt if ch.isdigit() or ch == ".")
-                if digits:
-                    return float(digits)
+                loc = self._page.locator(sel)
+                count = await loc.count()
+                for i in range(min(count, 30)):
+                    txt = await loc.nth(i).text_content(timeout=300)
+                    if not txt or "bonus" in txt.lower():
+                        continue
+                    m = re.search(r"(\\d+(?:[\\.,]\\d+)?)\\s*%", txt)
+                    if m:
+                        v = float(m.group(1).replace(",", "."))
+                        if 55.0 <= v < 99.0:
+                            fallback_vals.append(v)
+                            continue
+                    digits = re.sub(r"[^\\d\\.,]", "", txt)
+                    if digits:
+                        v = float(digits.replace(",", "."))
+                        if 55.0 <= v < 99.0:
+                            fallback_vals.append(v)
             except Exception:
                 continue
+        if fallback_vals:
+            return max(fallback_vals)
         return 80.0
 
     async def place_order(self, asset: str, amount: float, direction: str, expiry_sec: int) -> str:
@@ -359,7 +431,9 @@ class PocketOptionBrowserAdapter:
             won = exit_price < order["entry"]
             tie = exit_price == order["entry"]
         result = "draw" if tie else ("win" if won else "loss")
-        return {"order_id": order_id, "result": result, "won": won, "entry": order["entry"], "exit": exit_price}
+        # On a draw, won=True so the losing-streak counter is not incremented (pnl will be ~0).
+        won_flag = True if tie else won
+        return {"order_id": order_id, "result": result, "won": won_flag, "entry": order["entry"], "exit": exit_price, "pnl": 0.0 if tie else None}
 
     async def get_balance(self) -> float:
         if self._page is None:

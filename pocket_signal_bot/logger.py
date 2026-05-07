@@ -38,9 +38,21 @@ class JsonEventLogger:
                 flush=True,
             )
         elif event_type == "order_result":
+            st = int(payload.get("session_trades") or 0)
+            spnl = payload.get("session_pnl")
+            sw = payload.get("session_wins")
+            sl = payload.get("session_losses")
+            wr = payload.get("win_rate_pct")
+            extra = ""
+            if st > 0 and spnl is not None and sw is not None and sl is not None and wr is not None:
+                extra = (
+                    f" | session PnL={spnl:+.4f} trades={st} "
+                    f"W/L={sw}/{sl} winrate={wr}%"
+                )
             print(
                 f"[{ts}] RESULT mode={payload.get('mode')} won={payload.get('won')} "
-                f"pnl={payload.get('pnl', '—')} balance={payload.get('balance', '—')} id={payload.get('order_id')}",
+                f"pnl={payload.get('pnl', '—')} balance={payload.get('balance', '—')} "
+                f"id={payload.get('order_id')}{extra}",
                 flush=True,
             )
         elif event_type == "no_candles":
