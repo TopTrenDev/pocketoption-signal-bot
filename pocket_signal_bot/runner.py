@@ -64,7 +64,6 @@ class HybridRunner:
                 max_signal_age_ms=cfg.max_signal_age_ms,
                 max_consecutive_losses=cfg.max_consecutive_losses,
                 max_trades_per_day=cfg.max_trades_per_day,
-                daily_profit_stop_pct=cfg.daily_profit_stop_pct,
                 daily_loss_stop_pct=cfg.daily_loss_stop_pct,
             ),
             start_balance=1000.0,
@@ -83,35 +82,146 @@ class HybridRunner:
         # Session stats (since process start): realized PnL from settled trades + win rate
         self._session_pnl: float = 0.0
         self._session_trades: int = 0
+        # Wins/losses for stats: profit > 0 / profit < 0 (pushes excluded from win rate)
         self._session_wins: int = 0
         self._session_losses: int = 0
+        self._session_pushes: int = 0
+        self._volatile_pause_until: float = 0.0
 
-    def _record_session_trade(self, *, won: bool, pnl: float) -> dict[str, Any]:
-        self._session_pnl += float(pnl)
-        self._session_trades += 1
+    @staticmethod
+    def _normalize_settled_pnl(result: dict[str, Any], trade_amount: float, payout_pct: float) -> float:
+        """Single realized P&L number per trade (stake loss = negative, win = payout on stake, push = 0)."""
+        amt = float(trade_amount)
+        pay = float(payout_pct)
+        status = str(result.get("result", "") or "").lower()
+        if status == "draw":
+            return 0.0
+        raw = result.get("pnl")
+        if raw is not None and isinstance(raw, (int, float)):
+            pnl = float(raw)
+            # Some paths report profit=0 on a loss; infer full stake loss.
+            if pnl == 0.0 and status == "loss":
+                return -amt
+            return pnl
+        won = bool(result.get("won", False))
         if won:
+            return amt * (pay / 100.0)
+        return -amt
+
+    def _record_session_trade(self, *, pnl: float) -> dict[str, Any]:
+        pnl = float(pnl)
+        self._session_pnl += pnl
+        self._session_trades += 1
+        if pnl > 0:
             self._session_wins += 1
-        else:
+        elif pnl < 0:
             self._session_losses += 1
-        n = self._session_trades
-        wr = (self._session_wins / n * 100.0) if n else 0.0
+        else:
+            self._session_pushes += 1
+        decided = self._session_wins + self._session_losses
+        wr: float | None
+        if decided > 0:
+            wr = round((self._session_wins / decided) * 100.0, 2)
+        else:
+            wr = None
         return {
             "session_pnl": round(self._session_pnl, 4),
-            "session_trades": n,
+            "session_trades": self._session_trades,
             "session_wins": self._session_wins,
             "session_losses": self._session_losses,
-            "win_rate_pct": round(wr, 2),
+            "session_pushes": self._session_pushes,
+            "win_rate_pct": wr,
         }
 
     def _session_overlay_line(self) -> str:
         n = self._session_trades
         if n == 0:
             return "Session PnL: +0.00  |  trades: 0  |  win rate: —"
-        wr = self._session_wins / n * 100.0
+        decided = self._session_wins + self._session_losses
+        wr_s = f"{self._session_wins / decided * 100:.1f}%" if decided else "—"
         return (
             f"Session PnL: {self._session_pnl:+.2f}  |  trades: {n}  "
-            f"(W{self._session_wins}/L{self._session_losses})  |  win rate: {wr:.1f}%"
+            f"(W{self._session_wins}/L{self._session_losses}/P{self._session_pushes})  |  win rate: {wr_s}"
         )
+
+    @staticmethod
+    def _range_pct(close_prices: list[float], lookback: int) -> float:
+        if len(close_prices) < 2:
+            return 0.0
+        lb = max(2, min(len(close_prices), lookback))
+        recent = close_prices[-lb:]
+        hi = max(recent)
+        lo = min(recent)
+        base = abs(recent[-1]) if recent[-1] != 0 else 1.0
+        return ((hi - lo) / base) * 100.0
+
+    def _choose_trade_amount(self, signal: str, signal_info: dict[str, Any], closes: list[float]) -> dict[str, Any]:
+        base = max(0.0, float(self.cfg.trade_amount))
+        if signal not in ("CALL", "PUT") or not self.cfg.dynamic_size_enabled:
+            return {"amount": base, "mult": 1.0, "market_state": "normal", "volatile": False}
+
+        range_pct = self._range_pct(closes, int(self.cfg.volatility_lookback))
+        is_volatile = range_pct >= float(self.cfg.volatility_range_pct)
+        action = (self.cfg.volatile_action or "base").strip().lower()
+        if action not in ("base", "pause"):
+            action = "base"
+
+        if is_volatile and action == "pause":
+            now = time.time()
+            self._volatile_pause_until = max(self._volatile_pause_until, now + float(self.cfg.volatile_pause_sec))
+            return {
+                "amount": base,
+                "mult": 1.0,
+                "market_state": "volatile_pause",
+                "volatile": True,
+                "range_pct": round(range_pct, 5),
+            }
+        if is_volatile:
+            return {
+                "amount": base,
+                "mult": 1.0,
+                "market_state": "volatile_base",
+                "volatile": True,
+                "range_pct": round(range_pct, 5),
+            }
+
+        ema_diff = abs(float(signal_info.get("ema_diff", 0.0)))
+        rsi = float(signal_info.get("rsi", 50.0))
+        momentum = float(signal_info.get("momentum", 0.0))
+        rsi_bias = abs(rsi - 50.0)
+        dir_ok = (signal == "CALL" and momentum >= 0.0) or (signal == "PUT" and momentum <= 0.0)
+        strong = (
+            ema_diff >= float(self.cfg.strong_trend_ema_diff_min)
+            and rsi_bias >= float(self.cfg.strong_trend_rsi_bias_min)
+            and abs(momentum) >= float(self.cfg.strong_trend_momentum_min)
+            and dir_ok
+        )
+        if not strong:
+            return {
+                "amount": base,
+                "mult": 1.0,
+                "market_state": "normal",
+                "volatile": False,
+                "range_pct": round(range_pct, 5),
+            }
+
+        score = 1
+        if ema_diff >= float(self.cfg.strong_trend_ema_diff_min) * 1.8:
+            score += 1
+        if rsi_bias >= float(self.cfg.strong_trend_rsi_bias_min) * 1.4:
+            score += 1
+        if abs(momentum) >= float(self.cfg.strong_trend_momentum_min) * 1.8:
+            score += 1
+        max_mult = max(1.0, float(self.cfg.strong_trend_max_mult))
+        mult = min(max_mult, float(1 + score))
+        amount = base * mult
+        return {
+            "amount": round(amount, 8),
+            "mult": round(mult, 3),
+            "market_state": "strong_trend",
+            "volatile": False,
+            "range_pct": round(range_pct, 5),
+        }
 
     # ── Signal post-processing ───────────────────────────────────────────────
 
@@ -160,6 +270,7 @@ class HybridRunner:
         *,
         signal: str,
         payout: float,
+        trade_amount: float,
         can_trade: bool,
         reason: str,
         candles_adapter: str,
@@ -171,7 +282,7 @@ class HybridRunner:
         lq = getattr(self.browser, "last_ws_quote", None)
         lines = [
             f"PocketOption bot  |  {self.cfg.effective_mode.upper()}",
-            f"Symbol: {self.cfg.symbol}  |  amount: {self.cfg.trade_amount}",
+            f"Symbol: {self.cfg.symbol}  |  amount: {trade_amount}",
             f"Signal: {signal}  |  payout: {payout}%",
             f"Trade allowed: {'YES' if can_trade else 'NO'} ({reason})",
             f"Candles source: {candles_adapter}",
@@ -335,13 +446,13 @@ class HybridRunner:
             self.logger.log("payout_error", adapter="browser", error=str(e2))
             return max(self.cfg.min_payout_pct, 80.0), "fallback"
 
-    async def _place_with_failover(self, direction: str) -> tuple[str, str]:
+    async def _place_with_failover(self, direction: str, amount: float) -> tuple[str, str]:
         if not self.cfg.requires_broker:
             return "paper-order", "paper"
         if self._api_connected:
             try:
                 order_id = await self._api_call(
-                    self.api.place_order(self.cfg.symbol, self.cfg.trade_amount, direction, self.cfg.expiry_sec),
+                    self.api.place_order(self.cfg.symbol, amount, direction, self.cfg.expiry_sec),
                     what="place_order",
                 )
                 return order_id, "api"
@@ -349,7 +460,7 @@ class HybridRunner:
                 self._api_connected = False
                 self.logger.log("order_failover", from_adapter="api", to_adapter="browser", error=str(e))
         order_id = await self.browser.place_order(
-            self.cfg.symbol, self.cfg.trade_amount, direction, self.cfg.expiry_sec
+            self.cfg.symbol, amount, direction, self.cfg.expiry_sec
         )
         return order_id, "browser"
 
@@ -379,6 +490,7 @@ class HybridRunner:
             await self._refresh_browser_overlay(
                 signal="—",
                 payout=0.0,
+                trade_amount=self.cfg.trade_amount,
                 can_trade=False,
                 reason="starting",
                 candles_adapter="—",
@@ -393,6 +505,7 @@ class HybridRunner:
                     await self._refresh_browser_overlay(
                         signal="NO_TRADE",
                         payout=0.0,
+                        trade_amount=self.cfg.trade_amount,
                         can_trade=False,
                         reason="no_candles",
                         candles_adapter=candles_adapter,
@@ -420,12 +533,18 @@ class HybridRunner:
                 # signal_ts measured AFTER data fetch — reflects true freshness for risk gate
                 signal_ts = datetime.now(timezone.utc)
                 payout, payout_adapter = await self._get_payout_with_failover()
+                sizing = self._choose_trade_amount(signal, signal_info, closes)
+                trade_amount = float(sizing["amount"])
                 signal_age_ms = int((datetime.now(timezone.utc) - signal_ts).total_seconds() * 1000)
                 can_trade, reason = self.risk.can_trade(
                     payout_pct=payout,
                     signal_age_ms=signal_age_ms,
                     current_balance=self.balance,
                 )
+                now_ts = time.time()
+                if now_ts < self._volatile_pause_until:
+                    can_trade = False
+                    reason = "volatility_pause"
                 self.logger.log(
                     "signal",
                     signal=signal,
@@ -441,34 +560,53 @@ class HybridRunner:
                     ema_diff=round(float(signal_info.get("ema_diff", 0.0)), 8),
                     rsi=round(float(signal_info.get("rsi", 50.0)), 4),
                     momentum=round(float(signal_info.get("momentum", 0.0)), 8),
+                    amount=trade_amount,
+                    amount_mult=sizing.get("mult", 1.0),
+                    market_state=sizing.get("market_state", "normal"),
+                    range_pct=sizing.get("range_pct"),
                 )
                 await self._refresh_browser_overlay(
                     signal=signal,
                     payout=payout,
+                    trade_amount=trade_amount,
                     can_trade=can_trade,
                     reason=reason,
                     candles_adapter=candles_adapter,
                     last_close=closes[-1],
+                    extra=(
+                        f"State={sizing.get('market_state')} | "
+                        f"mult={sizing.get('mult', 1.0)}x | "
+                        f"range={sizing.get('range_pct', 0.0)}%"
+                    ),
                 )
 
                 if signal in {"CALL", "PUT"} and can_trade:
                     try:
-                        order_id, adapter_used = await self._place_with_failover(signal)
+                        order_id, adapter_used = await self._place_with_failover(signal, trade_amount)
                     except Exception as e:
                         self.logger.log("order_error", signal=signal, error=str(e))
                         await asyncio.sleep(self.cfg.poll_seconds)
                         continue
 
                     send_ts = datetime.now(timezone.utc)
-                    self.logger.log("order_sent", order_id=order_id, adapter=adapter_used, signal=signal)
+                    self.logger.log(
+                        "order_sent",
+                        order_id=order_id,
+                        adapter=adapter_used,
+                        signal=signal,
+                        amount=trade_amount,
+                        amount_mult=sizing.get("mult", 1.0),
+                        market_state=sizing.get("market_state", "normal"),
+                    )
                     await self._refresh_browser_overlay(
                         signal=signal,
                         payout=payout,
+                        trade_amount=trade_amount,
                         can_trade=True,
                         reason="order_sent",
                         candles_adapter=candles_adapter,
                         last_close=closes[-1],
-                        extra=f"ORDER → {adapter_used} id={order_id}",
+                        extra=f"ORDER → {adapter_used} id={order_id} amount={trade_amount}",
                     )
 
                     if self.cfg.effective_mode == "paper":
@@ -481,34 +619,40 @@ class HybridRunner:
                         exit_price = float(candles2[-1]["close"])
                         result = self.paper.settle(
                             direction=signal,
-                            amount=self.cfg.trade_amount,
+                            amount=trade_amount,
                             payout_pct=payout,
                             entry_price=entry,
                             exit_price=exit_price,
                         )
-                        self.balance += result.pnl
-                        self.risk.register_result(result.won)
-                        sess = self._record_session_trade(won=result.won, pnl=result.pnl)
+                        pnl = float(result.pnl)
+                        self.balance += pnl
+                        self.risk.register_result(pnl >= 0)
+                        sess = self._record_session_trade(pnl=pnl)
                         self.logger.log(
                             "order_result",
                             mode="paper",
                             order_id=order_id,
-                            won=result.won,
-                            pnl=round(result.pnl, 4),
+                            won=pnl > 0,
+                            push=pnl == 0,
+                            pnl=round(pnl, 4),
                             balance=round(self.balance, 2),
                             signal_ts=signal_ts.isoformat(),
                             send_ts=send_ts.isoformat(),
                             result_ts=datetime.now(timezone.utc).isoformat(),
+                            amount=trade_amount,
+                            amount_mult=sizing.get("mult", 1.0),
+                            market_state=sizing.get("market_state", "normal"),
                             **sess,
                         )
                         await self._refresh_browser_overlay(
                             signal=signal,
                             payout=payout,
+                            trade_amount=trade_amount,
                             can_trade=True,
                             reason="order_done",
                             candles_adapter=candles_adapter,
                             last_close=closes[-1],
-                            extra=f"RESULT won={result.won} pnl={result.pnl:+.2f}",
+                            extra=f"RESULT outcome={'win' if pnl > 0 else 'loss' if pnl < 0 else 'push'} pnl={pnl:+.2f}",
                         )
                     else:
                         try:
@@ -524,36 +668,41 @@ class HybridRunner:
                             await asyncio.sleep(self.cfg.poll_seconds)
                             continue
 
-                        won = bool(result.get("won", False))
-                        pnl = result.get("pnl")
-                        if pnl is None:
-                            pnl = self.cfg.trade_amount * (payout / 100.0) if won else -self.cfg.trade_amount
+                        pnl = self._normalize_settled_pnl(result, trade_amount, payout)
                         self.balance += float(pnl)
-                        self.risk.register_result(won)
-                        sess = self._record_session_trade(won=won, pnl=float(pnl))
+                        self.risk.register_result(float(pnl) >= 0)
+                        sess = self._record_session_trade(pnl=float(pnl))
                         # Refresh live balance from broker to correct any drift
                         await self._refresh_balance()
                         self.logger.log(
                             "order_result",
                             mode=self.cfg.effective_mode,
                             order_id=order_id,
-                            won=won,
+                            won=float(pnl) > 0,
+                            push=float(pnl) == 0,
                             pnl=round(float(pnl), 4),
                             balance=round(self.balance, 2),
                             raw_result=result,
                             signal_ts=signal_ts.isoformat(),
                             send_ts=send_ts.isoformat(),
                             result_ts=datetime.now(timezone.utc).isoformat(),
+                            amount=trade_amount,
+                            amount_mult=sizing.get("mult", 1.0),
+                            market_state=sizing.get("market_state", "normal"),
                             **sess,
                         )
                         await self._refresh_browser_overlay(
                             signal=signal,
                             payout=payout,
+                            trade_amount=trade_amount,
                             can_trade=True,
                             reason="order_done",
                             candles_adapter=candles_adapter,
                             last_close=closes[-1],
-                            extra=f"RESULT won={won} pnl={float(pnl):+.2f}",
+                            extra=(
+                                f"RESULT outcome={'win' if float(pnl) > 0 else 'loss' if float(pnl) < 0 else 'push'} "
+                                f"pnl={float(pnl):+.2f}"
+                            ),
                         )
 
                 await asyncio.sleep(self.cfg.poll_seconds)

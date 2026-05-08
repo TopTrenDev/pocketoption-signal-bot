@@ -28,13 +28,16 @@ class JsonEventLogger:
             print(
                 f"[{ts}] SIGNAL {payload.get('signal')} | payout={payload.get('payout_pct')}% "
                 f"| trade={'YES' if ok else 'NO'} ({payload.get('reason')}) "
+                f"| amount={payload.get('amount')} ({payload.get('amount_mult', 1.0)}x {payload.get('market_state')}) "
                 f"| candles={payload.get('candles_adapter')} payout_src={payload.get('payout_adapter')} "
                 f"| ema_diff={payload.get('ema_diff')} rsi={payload.get('rsi')} momentum={payload.get('momentum')}",
                 flush=True,
             )
         elif event_type == "order_sent":
             print(
-                f"[{ts}] ORDER SENT {payload.get('signal')} adapter={payload.get('adapter')} id={payload.get('order_id')}",
+                f"[{ts}] ORDER SENT {payload.get('signal')} adapter={payload.get('adapter')} "
+                f"amount={payload.get('amount', '—')} ({payload.get('amount_mult', 1.0)}x {payload.get('market_state', 'normal')}) "
+                f"id={payload.get('order_id')}",
                 flush=True,
             )
         elif event_type == "order_result":
@@ -42,15 +45,18 @@ class JsonEventLogger:
             spnl = payload.get("session_pnl")
             sw = payload.get("session_wins")
             sl = payload.get("session_losses")
+            sp = payload.get("session_pushes")
             wr = payload.get("win_rate_pct")
             extra = ""
-            if st > 0 and spnl is not None and sw is not None and sl is not None and wr is not None:
+            if st > 0 and spnl is not None and sw is not None and sl is not None and sp is not None:
+                wr_s = f"{wr}%" if wr is not None else "—"
                 extra = (
                     f" | session PnL={spnl:+.4f} trades={st} "
-                    f"W/L={sw}/{sl} winrate={wr}%"
+                    f"W/L/P={sw}/{sl}/{sp} winrate={wr_s} (wins ÷ wins+losses)"
                 )
             print(
                 f"[{ts}] RESULT mode={payload.get('mode')} won={payload.get('won')} "
+                f"push={payload.get('push')} "
                 f"pnl={payload.get('pnl', '—')} balance={payload.get('balance', '—')} "
                 f"id={payload.get('order_id')}{extra}",
                 flush=True,

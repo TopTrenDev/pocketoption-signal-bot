@@ -77,8 +77,17 @@ class BotConfig:
     max_signal_age_ms: int = _env_int("PO_MAX_SIGNAL_AGE_MS", 1500)
     max_consecutive_losses: int = _env_int("PO_MAX_CONSECUTIVE_LOSSES", 3)
     max_trades_per_day: int = _env_int("PO_MAX_TRADES_PER_DAY", 20)
-    daily_profit_stop_pct: float = _env_float("PO_DAILY_PROFIT_STOP_PCT", 2.0)
     daily_loss_stop_pct: float = _env_float("PO_DAILY_LOSS_STOP_PCT", 2.0)
+    # Dynamic sizing / volatility controls
+    dynamic_size_enabled: bool = _env_bool("PO_DYNAMIC_SIZE_ENABLED", True)
+    strong_trend_max_mult: float = max(1.0, _env_float("PO_STRONG_TREND_MAX_MULT", 5.0))
+    strong_trend_ema_diff_min: float = max(0.0, _env_float("PO_STRONG_TREND_EMA_DIFF_MIN", 0.00003))
+    strong_trend_rsi_bias_min: float = max(0.0, _env_float("PO_STRONG_TREND_RSI_BIAS_MIN", 6.0))
+    strong_trend_momentum_min: float = max(0.0, _env_float("PO_STRONG_TREND_MOMENTUM_MIN", 0.00002))
+    volatility_lookback: int = max(5, _env_int("PO_VOLATILITY_LOOKBACK", 12))
+    volatility_range_pct: float = max(0.0, _env_float("PO_VOLATILITY_RANGE_PCT", 0.12))
+    volatile_action: str = os.getenv("PO_VOLATILE_ACTION", "base")
+    volatile_pause_sec: int = max(0, _env_int("PO_VOLATILE_PAUSE_SEC", 90))
 
     # Runtime mode: paper | demo | live
     mode: str = os.getenv("PO_MODE", "paper")

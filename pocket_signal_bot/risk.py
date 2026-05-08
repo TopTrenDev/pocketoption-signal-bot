@@ -10,7 +10,6 @@ class RiskConfig:
     max_signal_age_ms: int
     max_consecutive_losses: int
     max_trades_per_day: int
-    daily_profit_stop_pct: float
     daily_loss_stop_pct: float
 
 
@@ -36,9 +35,6 @@ class RiskManager:
         self._roll_day_if_needed(current_balance)
 
         pnl_pct = ((current_balance - self.day_start_balance) / self.day_start_balance) * 100 if self.day_start_balance > 0 else 0
-        if pnl_pct >= self.cfg.daily_profit_stop_pct:
-            self.halted_reason = "daily_profit_stop"
-            return False, self.halted_reason
         if pnl_pct <= -self.cfg.daily_loss_stop_pct:
             self.halted_reason = "daily_loss_stop"
             return False, self.halted_reason
