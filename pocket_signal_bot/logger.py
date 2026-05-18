@@ -28,7 +28,7 @@ class JsonEventLogger:
             print(
                 f"[{ts}] SIGNAL {payload.get('signal')} | payout={payload.get('payout_pct')}% "
                 f"| trade={'YES' if ok else 'NO'} ({payload.get('reason')}) "
-                f"| amount={payload.get('amount')} ({payload.get('amount_mult', 1.0)}x {payload.get('market_state')}) "
+                f"| amount={payload.get('amount')} "
                 f"| candles={payload.get('candles_adapter')} payout_src={payload.get('payout_adapter')} "
                 f"| ema_diff={payload.get('ema_diff')} rsi={payload.get('rsi')} momentum={payload.get('momentum')}",
                 flush=True,
@@ -36,7 +36,7 @@ class JsonEventLogger:
         elif event_type == "order_sent":
             print(
                 f"[{ts}] ORDER SENT {payload.get('signal')} adapter={payload.get('adapter')} "
-                f"amount={payload.get('amount', '—')} ({payload.get('amount_mult', 1.0)}x {payload.get('market_state', 'normal')}) "
+                f"amount={payload.get('amount', '—')} "
                 f"id={payload.get('order_id')}",
                 flush=True,
             )

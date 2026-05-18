@@ -86,7 +86,6 @@ class HybridRunner:
         self._session_wins: int = 0
         self._session_losses: int = 0
         self._session_pushes: int = 0
-        self._volatile_pause_until: float = 0.0
 
     @staticmethod
     def _normalize_settled_pnl(result: dict[str, Any], trade_amount: float, payout_pct: float) -> float:
@@ -99,6 +98,8 @@ class HybridRunner:
         raw = result.get("pnl")
         if raw is not None and isinstance(raw, (int, float)):
             pnl = float(raw)
+            if result.get("settlement_source") == "balance":
+                return pnl
             # Some paths report profit=0 on a loss; infer full stake loss.
             if pnl == 0.0 and status == "loss":
                 return -amt
@@ -143,85 +144,6 @@ class HybridRunner:
             f"Session PnL: {self._session_pnl:+.2f}  |  trades: {n}  "
             f"(W{self._session_wins}/L{self._session_losses}/P{self._session_pushes})  |  win rate: {wr_s}"
         )
-
-    @staticmethod
-    def _range_pct(close_prices: list[float], lookback: int) -> float:
-        if len(close_prices) < 2:
-            return 0.0
-        lb = max(2, min(len(close_prices), lookback))
-        recent = close_prices[-lb:]
-        hi = max(recent)
-        lo = min(recent)
-        base = abs(recent[-1]) if recent[-1] != 0 else 1.0
-        return ((hi - lo) / base) * 100.0
-
-    def _choose_trade_amount(self, signal: str, signal_info: dict[str, Any], closes: list[float]) -> dict[str, Any]:
-        base = max(0.0, float(self.cfg.trade_amount))
-        if signal not in ("CALL", "PUT") or not self.cfg.dynamic_size_enabled:
-            return {"amount": base, "mult": 1.0, "market_state": "normal", "volatile": False}
-
-        range_pct = self._range_pct(closes, int(self.cfg.volatility_lookback))
-        is_volatile = range_pct >= float(self.cfg.volatility_range_pct)
-        action = (self.cfg.volatile_action or "base").strip().lower()
-        if action not in ("base", "pause"):
-            action = "base"
-
-        if is_volatile and action == "pause":
-            now = time.time()
-            self._volatile_pause_until = max(self._volatile_pause_until, now + float(self.cfg.volatile_pause_sec))
-            return {
-                "amount": base,
-                "mult": 1.0,
-                "market_state": "volatile_pause",
-                "volatile": True,
-                "range_pct": round(range_pct, 5),
-            }
-        if is_volatile:
-            return {
-                "amount": base,
-                "mult": 1.0,
-                "market_state": "volatile_base",
-                "volatile": True,
-                "range_pct": round(range_pct, 5),
-            }
-
-        ema_diff = abs(float(signal_info.get("ema_diff", 0.0)))
-        rsi = float(signal_info.get("rsi", 50.0))
-        momentum = float(signal_info.get("momentum", 0.0))
-        rsi_bias = abs(rsi - 50.0)
-        dir_ok = (signal == "CALL" and momentum >= 0.0) or (signal == "PUT" and momentum <= 0.0)
-        strong = (
-            ema_diff >= float(self.cfg.strong_trend_ema_diff_min)
-            and rsi_bias >= float(self.cfg.strong_trend_rsi_bias_min)
-            and abs(momentum) >= float(self.cfg.strong_trend_momentum_min)
-            and dir_ok
-        )
-        if not strong:
-            return {
-                "amount": base,
-                "mult": 1.0,
-                "market_state": "normal",
-                "volatile": False,
-                "range_pct": round(range_pct, 5),
-            }
-
-        score = 1
-        if ema_diff >= float(self.cfg.strong_trend_ema_diff_min) * 1.8:
-            score += 1
-        if rsi_bias >= float(self.cfg.strong_trend_rsi_bias_min) * 1.4:
-            score += 1
-        if abs(momentum) >= float(self.cfg.strong_trend_momentum_min) * 1.8:
-            score += 1
-        max_mult = max(1.0, float(self.cfg.strong_trend_max_mult))
-        mult = min(max_mult, float(1 + score))
-        amount = base * mult
-        return {
-            "amount": round(amount, 8),
-            "mult": round(mult, 3),
-            "market_state": "strong_trend",
-            "volatile": False,
-            "range_pct": round(range_pct, 5),
-        }
 
     # ── Signal post-processing ───────────────────────────────────────────────
 
@@ -533,18 +455,13 @@ class HybridRunner:
                 # signal_ts measured AFTER data fetch — reflects true freshness for risk gate
                 signal_ts = datetime.now(timezone.utc)
                 payout, payout_adapter = await self._get_payout_with_failover()
-                sizing = self._choose_trade_amount(signal, signal_info, closes)
-                trade_amount = float(sizing["amount"])
+                trade_amount = float(self.cfg.trade_amount)
                 signal_age_ms = int((datetime.now(timezone.utc) - signal_ts).total_seconds() * 1000)
                 can_trade, reason = self.risk.can_trade(
                     payout_pct=payout,
                     signal_age_ms=signal_age_ms,
                     current_balance=self.balance,
                 )
-                now_ts = time.time()
-                if now_ts < self._volatile_pause_until:
-                    can_trade = False
-                    reason = "volatility_pause"
                 self.logger.log(
                     "signal",
                     signal=signal,
@@ -561,9 +478,6 @@ class HybridRunner:
                     rsi=round(float(signal_info.get("rsi", 50.0)), 4),
                     momentum=round(float(signal_info.get("momentum", 0.0)), 8),
                     amount=trade_amount,
-                    amount_mult=sizing.get("mult", 1.0),
-                    market_state=sizing.get("market_state", "normal"),
-                    range_pct=sizing.get("range_pct"),
                 )
                 await self._refresh_browser_overlay(
                     signal=signal,
@@ -573,11 +487,6 @@ class HybridRunner:
                     reason=reason,
                     candles_adapter=candles_adapter,
                     last_close=closes[-1],
-                    extra=(
-                        f"State={sizing.get('market_state')} | "
-                        f"mult={sizing.get('mult', 1.0)}x | "
-                        f"range={sizing.get('range_pct', 0.0)}%"
-                    ),
                 )
 
                 if signal in {"CALL", "PUT"} and can_trade:
@@ -595,8 +504,6 @@ class HybridRunner:
                         adapter=adapter_used,
                         signal=signal,
                         amount=trade_amount,
-                        amount_mult=sizing.get("mult", 1.0),
-                        market_state=sizing.get("market_state", "normal"),
                     )
                     await self._refresh_browser_overlay(
                         signal=signal,
@@ -640,8 +547,6 @@ class HybridRunner:
                             send_ts=send_ts.isoformat(),
                             result_ts=datetime.now(timezone.utc).isoformat(),
                             amount=trade_amount,
-                            amount_mult=sizing.get("mult", 1.0),
-                            market_state=sizing.get("market_state", "normal"),
                             **sess,
                         )
                         await self._refresh_browser_overlay(
@@ -687,8 +592,6 @@ class HybridRunner:
                             send_ts=send_ts.isoformat(),
                             result_ts=datetime.now(timezone.utc).isoformat(),
                             amount=trade_amount,
-                            amount_mult=sizing.get("mult", 1.0),
-                            market_state=sizing.get("market_state", "normal"),
                             **sess,
                         )
                         await self._refresh_browser_overlay(

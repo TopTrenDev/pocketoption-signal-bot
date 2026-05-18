@@ -408,32 +408,118 @@ class PocketOptionBrowserAdapter:
 
         order_id = f"browser-{int(time.time() * 1000)}"
         entry = await self._read_price()
+        balance_before = await self.get_balance()
         self._orders[order_id] = {
             "direction": direction,
             "amount": float(amount),
             "expiry_sec": int(expiry_sec),
             "entry": entry,
             "open_ts": time.time(),
+            "balance_before": balance_before,
         }
         return order_id
+
+    @staticmethod
+    def _classify_pnl_from_balance_delta(pnl: float, stake: float) -> tuple[str, bool]:
+        """Map balance change to Pocket Option outcome (win / loss / draw)."""
+        stake = max(0.01, float(stake))
+        tol = max(0.02, stake * 0.05)
+        if pnl > tol:
+            return "win", True
+        if pnl < -tol:
+            return "loss", False
+        return "draw", True
+
+    @staticmethod
+    def _prices_plausible_for_settlement(entry: float, exit: float) -> bool:
+        """Reject DOM mis-reads (timers, payout %, etc.) when guessing from prices."""
+        if entry <= 0 or exit <= 0:
+            return False
+        ref = max(abs(entry), abs(exit), 1e-9)
+        return (abs(entry - exit) / ref) <= 0.25
+
+    async def _read_balance_after_settle(self, polls: int = 5) -> float:
+        """Re-read demo balance a few times after expiry so settlement is applied."""
+        last = 0.0
+        for _ in range(max(1, polls)):
+            await self._page.wait_for_timeout(400)  # type: ignore[union-attr]
+            last = await self.get_balance()
+        return last
+
+    async def _settle_from_balance(self, order: dict[str, Any]) -> dict[str, Any] | None:
+        before = float(order.get("balance_before") or 0.0)
+        if before <= 0:
+            return None
+        after = await self._read_balance_after_settle()
+        if after <= 0:
+            return None
+        stake = float(order["amount"])
+        pnl = round(after - before, 4)
+        result, won_flag = self._classify_pnl_from_balance_delta(pnl, stake)
+        return {
+            "order_id": "",
+            "result": result,
+            "won": won_flag,
+            "pnl": pnl if result == "draw" else pnl,
+            "balance_before": before,
+            "balance_after": after,
+            "settlement_source": "balance",
+        }
+
+    async def _settle_from_price_guess(self, order: dict[str, Any], exit_price: float) -> dict[str, Any]:
+        entry = float(order["entry"])
+        direction = str(order["direction"])
+        if not self._prices_plausible_for_settlement(entry, exit_price):
+            return {
+                "order_id": "",
+                "result": "unknown",
+                "won": False,
+                "pnl": None,
+                "entry": entry,
+                "exit": exit_price,
+                "settlement_source": "price_unreliable",
+            }
+        eps = max(1e-9, abs(entry) * 1e-6)
+        if direction == "CALL":
+            won = exit_price > entry + eps
+            tie = abs(exit_price - entry) <= eps
+        else:
+            won = exit_price < entry - eps
+            tie = abs(exit_price - entry) <= eps
+        result = "draw" if tie else ("win" if won else "loss")
+        won_flag = True if tie else won
+        return {
+            "order_id": "",
+            "result": result,
+            "won": won_flag,
+            "entry": entry,
+            "exit": exit_price,
+            "pnl": 0.0 if tie else None,
+            "settlement_source": "price_guess",
+        }
 
     async def check_result(self, order_id: str, wait_sec: int) -> dict[str, Any]:
         order = self._orders.get(order_id)
         if not order:
             return {"order_id": order_id, "result": "unknown", "won": False}
         await self._page.wait_for_timeout((wait_sec + 1) * 1000)  # type: ignore[union-attr]
-        exit_price = await self._read_price()
-        direction = order["direction"]
-        if direction == "CALL":
-            won = exit_price > order["entry"]
-            tie = exit_price == order["entry"]
+
+        settled = await self._settle_from_balance(order)
+        if settled is None:
+            try:
+                exit_price = await self._read_price()
+            except Exception:
+                exit_price = 0.0
+            settled = await self._settle_from_price_guess(order, exit_price)
         else:
-            won = exit_price < order["entry"]
-            tie = exit_price == order["entry"]
-        result = "draw" if tie else ("win" if won else "loss")
-        # On a draw, won=True so the losing-streak counter is not incremented (pnl will be ~0).
-        won_flag = True if tie else won
-        return {"order_id": order_id, "result": result, "won": won_flag, "entry": order["entry"], "exit": exit_price, "pnl": 0.0 if tie else None}
+            try:
+                settled["exit"] = await self._read_price()
+            except Exception:
+                settled["exit"] = None
+            settled["entry"] = order["entry"]
+
+        settled["order_id"] = order_id
+        return settled
 
     async def get_balance(self) -> float:
         if self._page is None:
