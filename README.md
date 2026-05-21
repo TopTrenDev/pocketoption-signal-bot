@@ -1,11 +1,8 @@
-# Hybrid Trading Bots (MT5 + PocketOption)
+# PocketOption Signal Bot
 
-This workspace now contains two independent bot paths:
+Hybrid PocketOption bot (`paper`, `demo`, and `live`) in `pocket_signal_bot/`.
 
-- `mt5_signal_bot.py`: MT5 EUR/USD signal bot
-- `pocket_signal_bot/`: PocketOption hybrid signal bot (`paper` + `demo`)
-
-## PocketOption Hybrid Signal Bot
+## Overview
 
 The PocketOption bot is designed around:
 
