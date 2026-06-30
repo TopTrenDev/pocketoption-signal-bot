@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import json
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 
 class JsonEventLogger:
-    """Writes one JSON line per event to a file; optionally prints readable lines to the console."""
+    """Console-only event lines (no file logging)."""
 
-    def __init__(self, log_path: str, *, console: bool = True) -> None:
-        self.path = Path(log_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, *, console: bool = True) -> None:
         self.console = console
 
     def _print_console(self, event_type: str, payload: dict[str, Any]) -> None:
@@ -81,15 +77,9 @@ class JsonEventLogger:
             print(f"[{ts}] {event_type} {short}", flush=True)
 
     def log(self, event_type: str, **payload: Any) -> None:
-        row = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "event_type": event_type,
-            **payload,
-        }
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=True) + "\n")
-        if self.console:
-            try:
-                self._print_console(event_type, dict(payload))
-            except Exception as e:
-                print(f"[logger] console print error: {e}", file=sys.stderr, flush=True)
+        if not self.console:
+            return
+        try:
+            self._print_console(event_type, dict(payload))
+        except Exception as e:
+            print(f"[logger] console print error: {e}", file=sys.stderr, flush=True)

@@ -17,7 +17,7 @@ from pocket_signal_bot.strategy import EmaRsiStrategy, StrategyConfig
 class HybridRunner:
     def __init__(self, cfg: BotConfig):
         self.cfg = cfg
-        self.logger = JsonEventLogger("logs/pocket_signal_events.jsonl", console=cfg.po_console_log)
+        self.logger = JsonEventLogger(console=cfg.po_console_log)
         self.strategy = EmaRsiStrategy(
             StrategyConfig(
                 ema_fast=cfg.ema_fast,

@@ -106,7 +106,7 @@ python -m pocket_signal_bot.runner
 
 The bot refuses to start `PO_MODE=live` unless `PO_LIVE_CONFIRMED=true`.
 
-Logs are written to `logs/pocket_signal_events.jsonl`.
+Event output goes to the terminal when `PO_CONSOLE_LOG=true` (no log files are written).
 
 ## Readiness checklist before live
 
