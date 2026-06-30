@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 from collections import deque
 import json
+import os
 import re
 import time
 
@@ -21,6 +22,34 @@ class BrowserConfig:
     show_overlay: bool = True
     ws_debug: bool = False
     ws_debug_max_lines: int = 120
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _screen_size() -> tuple[int, int]:
+    """Primary monitor size (Windows); fallback 1920×1080."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+    except Exception:
+        return 1920, 1080
 
 
 class PocketOptionBrowserAdapter:
@@ -199,17 +228,114 @@ class PocketOptionBrowserAdapter:
         self._last_ws_ts = now
         self._ticks.append((now, p))
 
+    async def _maximize_browser_window(self) -> None:
+        if self._page is None or self.cfg.headless:
+            return
+        try:
+            cdp = await self._page.context.new_cdp_session(self._page)
+            window_id = (await cdp.send("Browser.getWindowForTarget"))["windowId"]
+            await cdp.send(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"windowState": "maximized"}},
+            )
+            await self._page.wait_for_timeout(350)
+        except Exception:
+            pass
+
+    async def _read_window_dims(self) -> dict[str, int]:
+        if self._page is None:
+            return {"innerW": 1920, "innerH": 1080, "outerW": 1920, "outerH": 1080}
+        raw = await self._page.evaluate(
+            """() => ({
+              innerW: window.innerWidth || 1280,
+              innerH: window.innerHeight || 720,
+              outerW: window.outerWidth || 1280,
+              outerH: window.outerHeight || 720,
+              availW: window.screen.availWidth || 1920,
+              availH: window.screen.availHeight || 1080,
+            })"""
+        )
+        return {k: int(raw.get(k) or 0) for k in ("innerW", "innerH", "outerW", "outerH", "availW", "availH")}
+
+    async def _sync_viewport_to_window(self) -> None:
+        """Match Playwright layout viewport to the real browser content area (fixes white bars)."""
+        if self._page is None or self.cfg.headless:
+            return
+        await self._maximize_browser_window()
+        dims = await self._read_window_dims()
+        target_w = max(1024, dims["availW"], dims["outerW"], dims["innerW"])
+        target_h = max(600, dims["availH"], dims["outerH"], dims["innerH"])
+        # Playwright default is 1280×720 — if inner is still small, force viewport to screen size.
+        if dims["innerW"] < int(target_w * 0.92) or dims["innerH"] < int(target_h * 0.85):
+            try:
+                await self._page.set_viewport_size({"width": target_w, "height": target_h})
+                await self._page.wait_for_timeout(200)
+            except Exception:
+                pass
+        await self._page.evaluate(
+            """() => {
+              window.dispatchEvent(new Event('resize'));
+              const css = document.getElementById('__po_bot_viewport_fix__');
+              if (!css) {
+                const el = document.createElement('style');
+                el.id = '__po_bot_viewport_fix__';
+                el.textContent = `
+                  html, body {
+                    width: 100% !important;
+                    min-height: 100vh !important;
+                    margin: 0 !important;
+                    overflow-x: hidden;
+                  }
+                `;
+                (document.head || document.documentElement).appendChild(el);
+              }
+            }"""
+        )
+
     async def connect(self) -> None:
         try:
             from playwright.async_api import async_playwright  # type: ignore
         except Exception as e:
             raise RuntimeError("Install playwright: pip install playwright && playwright install chromium") from e
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self.cfg.headless)
-        context = await self._browser.new_context()
+
+        screen_w, screen_h = _screen_size()
+        cfg_w = _env_int("PO_BROWSER_WIDTH", 0)
+        cfg_h = _env_int("PO_BROWSER_HEIGHT", 0)
+        width = max(1024, cfg_w or screen_w)
+        height = max(600, cfg_h or screen_h)
+        start_max = _env_bool("PO_BROWSER_START_MAXIMIZED", True)
+
+        launch_args: list[str] = ["--disable-infobars"]
+        if not self.cfg.headless:
+            if start_max:
+                launch_args.append("--start-maximized")
+            else:
+                launch_args.extend([f"--window-size={width},{height}", "--window-position=0,0"])
+
+        self._browser = await self._playwright.chromium.launch(
+            headless=self.cfg.headless,
+            args=launch_args,
+        )
+
+        if self.cfg.headless:
+            context = await self._browser.new_context(
+                viewport={"width": width, "height": height},
+                device_scale_factor=1,
+            )
+        else:
+            context = await self._browser.new_context(
+                no_viewport=True,
+                screen={"width": width, "height": height},
+            )
+
         self._page = await context.new_page()
+        if not self.cfg.headless:
+            await self._sync_viewport_to_window()
         self._page.on("websocket", self._on_websocket)
         await self._page.goto(self.cfg.base_url, wait_until="domcontentloaded")
+        if not self.cfg.headless:
+            await self._sync_viewport_to_window()
         await self._page.wait_for_timeout(int(self.cfg.startup_wait_ms))
 
     async def show_status_overlay(self, text: str) -> None:
