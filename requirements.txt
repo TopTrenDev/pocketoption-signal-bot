@@ -3,3 +3,4 @@ pocket-option>=0.1.6
 playwright>=1.52.0
 python-dotenv>=1.0.0
 websockets
+matplotlib>=3.8.0

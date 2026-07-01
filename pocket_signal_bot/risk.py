@@ -54,4 +54,3 @@ class RiskManager:
             self.consecutive_losses = 0
         else:
             self.consecutive_losses += 1
-

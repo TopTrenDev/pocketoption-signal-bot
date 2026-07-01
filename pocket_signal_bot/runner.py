@@ -12,6 +12,12 @@ from pocket_signal_bot.logger import JsonEventLogger
 from pocket_signal_bot.paper_simulator import PocketPaperSimulator
 from pocket_signal_bot.risk import RiskConfig, RiskManager
 from pocket_signal_bot.strategy import EmaRsiStrategy, StrategyConfig
+from pocket_signal_bot.trade_store import TradeStore
+
+try:
+    from pocket_signal_bot.charts import generate_charts
+except ImportError:
+    generate_charts = None  # type: ignore[misc, assignment]
 
 
 class HybridRunner:
@@ -86,6 +92,65 @@ class HybridRunner:
         self._session_wins: int = 0
         self._session_losses: int = 0
         self._session_pushes: int = 0
+        self.trade_store = TradeStore(cfg.trade_data_path)
+        self._session_id = self.trade_store.begin_session(self._session_config_snapshot())
+
+    def _session_config_snapshot(self) -> dict[str, Any]:
+        return {
+            "mode": self.cfg.effective_mode,
+            "symbol": self.cfg.symbol,
+            "timeframe_sec": self.cfg.timeframe_sec,
+            "expiry_sec": self.cfg.expiry_sec,
+            "time_pair": self.cfg.time_pair_label,
+            "experiment_label": self.cfg.experiment_label or self.cfg.time_pair_label,
+            "trade_amount": self.cfg.trade_amount,
+        }
+
+    def _persist_trade(
+        self,
+        *,
+        signal: str,
+        pnl: float,
+        order_id: str,
+        payout_pct: float,
+        amount: float,
+        adapter: str,
+        result_ts: str,
+    ) -> None:
+        self.trade_store.record_trade(
+            {
+                "ts": result_ts,
+                "side": "buy" if signal == "CALL" else "sell",
+                "signal": signal,
+                "order_id": order_id,
+                "amount": amount,
+                "payout_pct": payout_pct,
+                "pnl": round(float(pnl), 4),
+                "won": float(pnl) > 0,
+                "push": float(pnl) == 0,
+                "adapter": adapter,
+            }
+        )
+        if self.cfg.charts_auto and generate_charts is not None:
+            try:
+                paths = generate_charts(self.cfg.trade_data_path, self.cfg.charts_dir)
+                if paths:
+                    print(f"[charts] updated {paths[-1]}", flush=True)
+            except Exception as e:
+                print(f"[charts] skip: {e}", flush=True)
+
+    def _finalize_charts(self) -> None:
+        self.trade_store.end_session()
+        if generate_charts is None:
+            return
+        try:
+            paths = generate_charts(self.cfg.trade_data_path, self.cfg.charts_dir)
+            if paths:
+                print("[charts] saved:", flush=True)
+                for p in paths:
+                    print(f"  {p.resolve()}", flush=True)
+        except Exception as e:
+            print(f"[charts] failed: {e}", flush=True)
 
     @staticmethod
     def _normalize_settled_pnl(result: dict[str, Any], trade_amount: float, payout_pct: float) -> float:
@@ -535,6 +600,15 @@ class HybridRunner:
                         self.balance += pnl
                         self.risk.register_result(pnl >= 0)
                         sess = self._record_session_trade(pnl=pnl)
+                        self._persist_trade(
+                            signal=signal,
+                            pnl=pnl,
+                            order_id=order_id,
+                            payout_pct=payout,
+                            amount=trade_amount,
+                            adapter="paper",
+                            result_ts=datetime.now(timezone.utc).isoformat(),
+                        )
                         self.logger.log(
                             "order_result",
                             mode="paper",
@@ -577,6 +651,15 @@ class HybridRunner:
                         self.balance += float(pnl)
                         self.risk.register_result(float(pnl) >= 0)
                         sess = self._record_session_trade(pnl=float(pnl))
+                        self._persist_trade(
+                            signal=signal,
+                            pnl=float(pnl),
+                            order_id=order_id,
+                            payout_pct=payout,
+                            amount=trade_amount,
+                            adapter=adapter_used,
+                            result_ts=datetime.now(timezone.utc).isoformat(),
+                        )
                         # Refresh live balance from broker to correct any drift
                         await self._refresh_balance()
                         self.logger.log(
@@ -610,6 +693,7 @@ class HybridRunner:
 
                 await asyncio.sleep(self.cfg.poll_seconds)
         finally:
+            self._finalize_charts()
             await self._safe_disconnect()
 
 

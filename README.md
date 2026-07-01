@@ -108,6 +108,33 @@ The bot refuses to start `PO_MODE=live` unless `PO_LIVE_CONFIRMED=true`.
 
 Event output goes to the terminal when `PO_CONSOLE_LOG=true` (no log files are written).
 
+## Trade history & PNG charts
+
+Each run stores trades in `data/trading_history.json`. After every settled trade (if `PO_CHARTS_AUTO=true`), PNG charts are written to `data/charts/`:
+
+| File | Content |
+|------|---------|
+| `latest_pnl.png` | Cumulative PnL + per-trade bars (current session) |
+| `latest_winrate.png` | Win rate over trade number |
+| `compare_setups.png` | Compare **15/15**, **30/30**, **60/60**, **M5/M3** sessions |
+| `dashboard.png` | All sessions’ PnL curves overlaid |
+
+**A/B test workflow** — change Pocket Option + `.env` for each setup, run demo, stop bot (Ctrl+C), repeat:
+
+```env
+# Example: 15s candle + 15s bet
+PO_TIMEFRAME_SEC=15
+PO_EXPIRY_SEC=15
+```
+
+Regenerate charts anytime:
+
+```bash
+python -m pocket_signal_bot.charts
+```
+
+Optional: `PO_EXPERIMENT_LABEL=15/15` overrides the auto label used in comparison charts.
+
 ## Readiness checklist before live
 
 - At least 200+ demo trades logged

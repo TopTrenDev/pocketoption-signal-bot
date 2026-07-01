@@ -118,6 +118,20 @@ class BotConfig:
     po_browser_overlay: bool = _env_bool("PO_BROWSER_OVERLAY", True)
     po_ws_debug: bool = _env_bool("PO_WS_DEBUG", False)
 
+    # Trade history + charts (PNG)
+    trade_data_path: str = os.getenv("PO_TRADE_DATA_PATH", "data/trading_history.json")
+    charts_dir: str = os.getenv("PO_CHARTS_DIR", "data/charts")
+    charts_auto: bool = _env_bool("PO_CHARTS_AUTO", True)
+    experiment_label: str = os.getenv("PO_EXPERIMENT_LABEL", "").strip()
+
+    @property
+    def time_pair_label(self) -> str:
+        from pocket_signal_bot.trade_store import format_time_pair
+
+        if self.experiment_label:
+            return self.experiment_label
+        return format_time_pair(self.timeframe_sec, self.expiry_sec)
+
     @property
     def price_selector_list(self) -> list[str]:
         raw = (self.po_price_selectors or "").strip()
